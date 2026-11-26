@@ -1,0 +1,352 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Readify - PDF Reader</title>
+
+<script type="module">
+import * as pdfjsLib from
+"https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.mjs";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+"https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.mjs";
+
+let pdf = null;
+let fullText = "";
+let chunks = [];
+let currentChunk = 0;
+let voices = [];
+
+const $ = id => document.getElementById(id);
+
+function updateStatus(message) {
+  $("status").textContent = message;
+}
+
+function splitText(text) {
+  return text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
+}
+
+async function loadPDF(file) {
+  if (!file || file.type !== "application/pdf") {
+    updateStatus("Please select a PDF file.");
+    return;
+  }
+
+  stopReading();
+  updateStatus("Extracting PDF text...");
+  $("content").textContent = "";
+
+  try {
+    const data = await file.arrayBuffer();
+    pdf = await pdfjsLib.getDocument({
+      data: new Uint8Array(data)
+    }).promise;
+
+    let pages = [];
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+
+      const text = content.items
+        .map(item => item.str)
+        .join(" ");
+
+      pages.push(`PAGE ${i}\n${text}`);
+      updateStatus(`Extracting page ${i} of ${pdf.numPages}...`);
+    }
+
+    fullText = pages.join("\n\n");
+    chunks = splitText(fullText);
+    currentChunk = 0;
+
+    $("content").textContent = fullText;
+    $("filename").textContent = file.name;
+    $("pagecount").textContent = `${pdf.numPages} pages`;
+    $("reader").hidden = false;
+
+    updateStatus("PDF ready. Press play to begin.");
+  } catch (error) {
+    console.error(error);
+    updateStatus("Could not read this PDF. Please try another.");
+  }
+}
+
+function populateVoices() {
+  voices = speechSynthesis.getVoices();
+  const select = $("voice");
+  const previous = select.value;
+
+  select.innerHTML = "";
+
+  voices.forEach((voice, index) => {
+    const option = document.createElement("option");
+    option.value = index;
+    option.textContent = `${voice.name} (${voice.lang})`;
+    select.appendChild(option);
+  });
+
+  if (previous && voices[Number(previous)]) {
+    select.value = previous;
+  }
+}
+
+function speakChunk() {
+  if (currentChunk >= chunks.length) {
+    updateStatus("Finished reading!");
+    return;
+  }
+
+  const utterance = new SpeechSynthesisUtterance(
+    chunks[currentChunk]
+  );
+
+  utterance.rate = Number($("speed").value);
+
+  const selectedVoice = voices[Number($("voice").value)];
+  if (selectedVoice) utterance.voice = selectedVoice;
+
+  utterance.onend = () => {
+    if (!speechSynthesis.paused) {
+      currentChunk++;
+      updateProgress();
+      speakChunk();
+    }
+  };
+
+  utterance.onerror = event => {
+    if (event.error !== "canceled" &&
+        event.error !== "interrupted") {
+      updateStatus("Speech playback error.");
+    }
+  };
+
+  speechSynthesis.speak(utterance);
+  updateProgress();
+}
+
+function updateProgress() {
+  const percent = chunks.length
+    ? Math.round(currentChunk / chunks.length * 100)
+    : 0;
+
+  $("progress").value = percent;
+  $("progressLabel").textContent = `${percent}%`;
+}
+
+function play() {
+  if (!chunks.length) return;
+
+  if (speechSynthesis.paused) {
+    speechSynthesis.resume();
+    updateStatus("Reading...");
+    return;
+  }
+
+  if (speechSynthesis.speaking) return;
+
+  if (currentChunk >= chunks.length) currentChunk = 0;
+
+  speakChunk();
+  updateStatus("Reading...");
+}
+
+function pause() {
+  speechSynthesis.pause();
+  updateStatus("Paused.");
+}
+
+function stopReading() {
+  speechSynthesis.cancel();
+  currentChunk = 0;
+  updateProgress();
+  updateStatus("Stopped.");
+}
+
+function skip(seconds) {
+  currentChunk = Math.max(
+    0,
+    Math.min(chunks.length - 1,
+      currentChunk + (seconds > 0 ? 5 : -5))
+  );
+
+  speechSynthesis.cancel();
+  play();
+}
+
+$("upload").addEventListener("change", e =>
+  loadPDF(e.target.files[0])
+);
+
+$("play").addEventListener("click", play);
+$("pause").addEventListener("click", pause);
+$("stop").addEventListener("click", stopReading);
+
+$("back").addEventListener("click", () => skip(-15));
+$("forward").addEventListener("click", () => skip(15));
+
+$("speed").addEventListener("change", () => {
+  if (speechSynthesis.speaking) {
+    speechSynthesis.cancel();
+    play();
+  }
+});
+
+speechSynthesis.onvoiceschanged = populateVoices;
+populateVoices();
+
+</script>
+
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #101827;
+  color: #f3f4f6;
+  font-family: Arial, sans-serif;
+  padding: 24px;
+}
+
+main {
+  max-width: 760px;
+  margin: 30px auto;
+}
+
+h1 { font-size: 30px; }
+.subtitle { color: #9ca3af; }
+
+.panel {
+  background: #1e293b;
+  padding: 22px;
+  border-radius: 14px;
+  margin: 18px 0;
+}
+
+input, select, button {
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #475569;
+  font-size: 15px;
+}
+
+select {
+  background: #334155;
+  color: white;
+  width: 100%;
+  margin-top: 8px;
+}
+
+button {
+  cursor: pointer;
+  background: #334155;
+  color: white;
+  margin: 4px;
+}
+
+button.primary {
+  background: #2563eb;
+}
+
+button:hover { opacity: .85; }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin: 20px 0;
+}
+
+label {
+  display: block;
+  margin-top: 16px;
+  color: #cbd5e1;
+}
+
+progress {
+  width: 100%;
+  height: 12px;
+}
+
+#content {
+  max-height: 350px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  line-height: 1.7;
+  color: #cbd5e1;
+  font-size: 14px;
+}
+
+#reader[hidden] { display: none; }
+
+#status {
+  color: #93c5fd;
+  margin-top: 16px;
+}
+
+input[type=range] { width: 100%; }
+
+@media(max-width: 500px) {
+  body { padding: 12px; }
+  main { margin: 10px auto; }
+  .panel { padding: 16px; }
+}
+</style>
+</head>
+
+<body>
+<main>
+
+<h1>📖 Readify</h1>
+<p class="subtitle">Your personal PDF listening companion.</p>
+
+<div class="panel">
+  <h3>Upload your document</h3>
+  <input id="upload" type="file" accept=".pdf,application/pdf">
+  <p id="status">Ready to read.</p>
+</div>
+
+<div class="panel" id="reader" hidden>
+
+  <h3 id="filename">Document</h3>
+  <p id="pagecount"></p>
+
+  <div class="controls">
+    <button id="back">⏪ Back</button>
+    <button id="play" class="primary">▶ Play</button>
+    <button id="pause">⏸ Pause</button>
+    <button id="stop">⏹ Stop</button>
+    <button id="forward">⏩ Forward</button>
+  </div>
+
+  <label>Playback speed</label>
+  <select id="speed">
+    <option value="0.75">0.75×</option>
+    <option value="1" selected>1× Normal</option>
+    <option value="1.25">1.25×</option>
+    <option value="1.5">1.5×</option>
+    <option value="1.75">1.75×</option>
+    <option value="2">2×</option>
+  </select>
+
+  <label>Choose voice</label>
+  <select id="voice"></select>
+
+  <label>Reading progress</label>
+  <progress id="progress" value="0" max="100"></progress>
+  <p id="progressLabel">0%</p>
+
+</div>
+
+<div class="panel">
+  <h3>Extracted text</h3>
+  <div id="content">Your PDF text will appear here.</div>
+</div>
+
+</main>
+</body>
+</html>
