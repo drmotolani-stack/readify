@@ -4,349 +4,303 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Readify - PDF Reader</title>
-
+<title>Readify</title>
 <script type="module">
-import * as pdfjsLib from
-"https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.mjs";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-"https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.mjs";
-
-let pdf = null;
-let fullText = "";
-let chunks = [];
-let currentChunk = 0;
-let voices = [];
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.mjs";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.mjs";
 
 const $ = id => document.getElementById(id);
+let voices = [], sentences = [], index = 0, playing = false, paused = false, pdf = null, timer = null;
 
-function updateStatus(message) {
-  $("status").textContent = message;
+function status(s) { $("status").textContent = s; }
+
+function getEnglishVoices() {
+  voices = speechSynthesis.getVoices().filter(v => /^en(-|$)/i.test(v.lang));
+  const sel = $("voice");
+  const old = sel.value;
+  sel.innerHTML = "";
+  voices.forEach((v,i) => {
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `${v.name} (${v.lang})`;
+    sel.appendChild(o);
+  });
+  if (voices[old]) sel.value = old;
+}
+speechSynthesis.onvoiceschanged = getEnglishVoices;
+getEnglishVoices();
+
+function cleanLine(line) {
+  return line
+    .replace(/\s+/g, " ")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\bwww\.\S+/gi, "")
+    .replace(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi, "")
+    .trim();
 }
 
-function splitText(text) {
-  return text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
+function isNoise(line) {
+  if (!line) return true;
+  if (/^\d{1,4}$/.test(line)) return true;
+  if (/^(page\s*)?\d{1,4}\s*(of\s*\d{1,4})?$/i.test(line)) return true;
+  if (/https?:\/\/|www\.|@[\w.-]+\.[a-z]{2,}/i.test(line)) return true;
+  if (/^(copyright|all rights reserved|isbn)\b/i.test(line)) return true;
+  return false;
 }
 
-async function loadPDF(file) {
-  if (!file || file.type !== "application/pdf") {
-    updateStatus("Please select a PDF file.");
-    return;
-  }
-
-  stopReading();
-  updateStatus("Extracting PDF text...");
-  $("content").textContent = "";
-
-  try {
-    const data = await file.arrayBuffer();
-    pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(data)
-    }).promise;
-
-    let pages = [];
-
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-
-      const text = content.items
-        .map(item => item.str)
-        .join(" ");
-
-      pages.push(`PAGE ${i}\n${text}`);
-      updateStatus(`Extracting page ${i} of ${pdf.numPages}...`);
-    }
-
-    fullText = pages.join("\n\n");
-    chunks = splitText(fullText);
-    currentChunk = 0;
-
-    $("content").textContent = fullText;
-    $("filename").textContent = file.name;
-    $("pagecount").textContent = `${pdf.numPages} pages`;
-    $("reader").hidden = false;
-
-    updateStatus("PDF ready. Press play to begin.");
-  } catch (error) {
-    console.error(error);
-    updateStatus("Could not read this PDF. Please try another.");
-  }
+function isHeading(line) {
+  if (line.length > 100) return false;
+  if (/^(chapter|part|section|introduction|conclusion|preface|contents|appendix)\b/i.test(line)) return true;
+  if (line.length < 65 && line === line.toUpperCase() && /[A-Z]/.test(line)) return true;
+  if (line.length < 65 && !/[.!?]$/.test(line) && line.split(" ").length <= 8) return true;
+  return false;
 }
 
-function populateVoices() {
-  voices = speechSynthesis.getVoices();
-  const select = $("voice");
-  const previous = select.value;
-
-  select.innerHTML = "";
-
-  voices.forEach((voice, index) => {
-    const option = document.createElement("option");
-    option.value = index;
-    option.textContent = `${voice.name} (${voice.lang})`;
-    select.appendChild(option);
+function prepareText(pages) {
+  const allLines = pages.flatMap(p => p.split("\n").map(cleanLine));
+  const counts = {};
+  allLines.forEach(line => {
+    if (line.length > 3) counts[line.toLowerCase()] = (counts[line.toLowerCase()] || 0) + 1;
   });
 
-  if (previous && voices[Number(previous)]) {
-    select.value = previous;
-  }
+  const repeated = new Set(
+    Object.keys(counts).filter(k => counts[k] >= Math.max(3, Math.ceil(pages.length * 0.25)))
+  );
+
+  const output = [];
+  pages.forEach((page, i) => {
+    const lines = page.split("\n").map(cleanLine);
+    const cleaned = lines.filter(line =>
+      !isNoise(line) && !repeated.has(line.toLowerCase())
+    );
+
+    output.push({ heading: `Page ${i+1}`, text: cleaned.join(" ") });
+  });
+
+  let text = output.map(p => p.text).join("\n\n");
+  text = text.replace(/\s+/g, " ").trim();
+
+  // Remove repeated title-like phrases at the start when possible.
+  text = text.replace(/\b(Introduction)\s+\1\b/gi, "$1");
+
+  return text;
 }
 
-function speakChunk() {
-  if (currentChunk >= chunks.length) {
-    updateStatus("Finished reading!");
+function splitSentences(text) {
+  return text.match(/[^.!?]+[.!?]+(?:["')\]]*)|[^.!?]+$/g)
+    ?.map(s => s.trim()).filter(Boolean) || [];
+}
+
+function renderCaptions() {
+  const current = sentences[index] || "";
+  const next = sentences.slice(index+1, index+3).join(" ");
+  $("captionCurrent").textContent = current;
+  $("captionNext").textContent = next;
+  $("position").textContent = `Sentence ${index+1} of ${sentences.length}`;
+  $("progress").value = sentences.length ? (index / sentences.length) * 100 : 0;
+}
+
+function speak() {
+  if (!playing || index >= sentences.length) {
+    playing = false;
+    status("Finished reading.");
     return;
   }
 
-  const utterance = new SpeechSynthesisUtterance(
-    chunks[currentChunk]
-  );
+  renderCaptions();
+  const u = new SpeechSynthesisUtterance(sentences[index]);
+  u.rate = Number($("speed").value);
+  u.voice = voices[Number($("voice").value)] || null;
 
-  utterance.rate = Number($("speed").value);
-
-  const selectedVoice = voices[Number($("voice").value)];
-  if (selectedVoice) utterance.voice = selectedVoice;
-
-  utterance.onend = () => {
-    if (!speechSynthesis.paused) {
-      currentChunk++;
-      updateProgress();
-      speakChunk();
+  u.onend = () => {
+    if (playing && !paused) {
+      index++;
+      renderCaptions();
+      speak();
     }
   };
 
-  utterance.onerror = event => {
-    if (event.error !== "canceled" &&
-        event.error !== "interrupted") {
-      updateStatus("Speech playback error.");
+  u.onerror = e => {
+    if (e.error !== "canceled" && e.error !== "interrupted") {
+      status("Speech error. Try another voice.");
     }
   };
 
-  speechSynthesis.speak(utterance);
-  updateProgress();
-}
-
-function updateProgress() {
-  const percent = chunks.length
-    ? Math.round(currentChunk / chunks.length * 100)
-    : 0;
-
-  $("progress").value = percent;
-  $("progressLabel").textContent = `${percent}%`;
+  speechSynthesis.speak(u);
 }
 
 function play() {
-  if (!chunks.length) return;
-
-  if (speechSynthesis.paused) {
+  if (!sentences.length) return;
+  if (paused) {
+    paused = false;
+    playing = true;
     speechSynthesis.resume();
-    updateStatus("Reading...");
+    status("Reading...");
     return;
   }
-
-  if (speechSynthesis.speaking) return;
-
-  if (currentChunk >= chunks.length) currentChunk = 0;
-
-  speakChunk();
-  updateStatus("Reading...");
+  if (playing) return;
+  if (index >= sentences.length) index = 0;
+  playing = true;
+  status("Reading...");
+  speak();
 }
 
 function pause() {
+  paused = true;
+  playing = false;
   speechSynthesis.pause();
-  updateStatus("Paused.");
+  status("Paused.");
 }
 
-function stopReading() {
+function stop() {
+  playing = false;
+  paused = false;
   speechSynthesis.cancel();
-  currentChunk = 0;
-  updateProgress();
-  updateStatus("Stopped.");
+  index = 0;
+  renderCaptions();
+  status("Stopped.");
 }
 
-function skip(seconds) {
-  currentChunk = Math.max(
-    0,
-    Math.min(chunks.length - 1,
-      currentChunk + (seconds > 0 ? 5 : -5))
-  );
-
+function jump(n) {
   speechSynthesis.cancel();
-  play();
+  index = Math.max(0, Math.min(sentences.length-1, index+n));
+  paused = false;
+  playing = true;
+  speak();
 }
 
-$("upload").addEventListener("change", e =>
-  loadPDF(e.target.files[0])
-);
+$("upload").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  stop();
+  status("Reading PDF...");
+  $("preview").innerHTML = "";
+  try {
+    pdf = await pdfjsLib.getDocument({data: new Uint8Array(await file.arrayBuffer())}).promise;
+    let pages = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      pages.push(content.items.map(i => i.str).join(" "));
+      status(`Extracting page ${p} of ${pdf.numPages}`);
+    }
 
-$("play").addEventListener("click", play);
-$("pause").addEventListener("click", pause);
-$("stop").addEventListener("click", stopReading);
-
-$("back").addEventListener("click", () => skip(-15));
-$("forward").addEventListener("click", () => skip(15));
-
-$("speed").addEventListener("change", () => {
-  if (speechSynthesis.speaking) {
-    speechSynthesis.cancel();
-    play();
+    const text = prepareText(pages);
+    sentences = splitSentences(text);
+    index = 0;
+    $("preview").textContent = text;
+    $("filename").textContent = file.name;
+    $("reader").hidden = false;
+    renderCaptions();
+    status("Document ready.");
+  } catch (err) {
+    console.error(err);
+    status("Unable to read this PDF.");
   }
 });
 
-speechSynthesis.onvoiceschanged = populateVoices;
-populateVoices();
+$("play").onclick = play;
+$("pause").onclick = pause;
+$("stop").onclick = stop;
+$("back").onclick = () => jump(-5);
+$("forward").onclick = () => jump(5);
 
+$("speed").onchange = () => {
+  if (playing) {
+    speechSynthesis.cancel();
+    speak();
+  }
+};
+$("voice").onchange = () => {
+  if (playing) {
+    speechSynthesis.cancel();
+    speak();
+  }
+};
 </script>
 
 <style>
-* { box-sizing: border-box; }
-
+* {box-sizing:border-box}
 body {
-  margin: 0;
-  background: #101827;
-  color: #f3f4f6;
-  font-family: Arial, sans-serif;
-  padding: 24px;
+  background:#101827;color:#f1f5f9;font-family:Arial,sans-serif;
+  margin:0;padding:20px;
 }
-
-main {
-  max-width: 760px;
-  margin: 30px auto;
+main {max-width:800px;margin:25px auto}
+.panel {background:#1e293b;padding:20px;border-radius:14px;margin:16px 0}
+h1 {font-size:30px}
+label {display:block;margin-top:15px}
+button,select,input {
+  border-radius:8px;padding:12px;font-size:15px;
 }
-
-h1 { font-size: 30px; }
-.subtitle { color: #9ca3af; }
-
-.panel {
-  background: #1e293b;
-  padding: 22px;
-  border-radius: 14px;
-  margin: 18px 0;
+button {background:#334155;color:white;border:0;cursor:pointer;margin:4px}
+button.primary {background:#2563eb}
+select {background:#334155;color:white;width:100%;margin-top:8px}
+.controls {display:flex;flex-wrap:wrap;justify-content:center;margin:18px 0}
+#status {color:#93c5fd}
+progress {width:100%;height:12px}
+#captionCurrent {
+  font-size:23px;line-height:1.6;color:white;font-weight:bold;
 }
-
-input, select, button {
-  padding: 12px;
-  border-radius: 8px;
-  border: 1px solid #475569;
-  font-size: 15px;
-}
-
-select {
-  background: #334155;
-  color: white;
-  width: 100%;
-  margin-top: 8px;
-}
-
-button {
-  cursor: pointer;
-  background: #334155;
-  color: white;
-  margin: 4px;
-}
-
-button.primary {
-  background: #2563eb;
-}
-
-button:hover { opacity: .85; }
-
-.controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
-  margin: 20px 0;
-}
-
-label {
-  display: block;
-  margin-top: 16px;
-  color: #cbd5e1;
-}
-
-progress {
-  width: 100%;
-  height: 12px;
-}
-
-#content {
-  max-height: 350px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  line-height: 1.7;
-  color: #cbd5e1;
-  font-size: 14px;
-}
-
-#reader[hidden] { display: none; }
-
-#status {
-  color: #93c5fd;
-  margin-top: 16px;
-}
-
-input[type=range] { width: 100%; }
-
-@media(max-width: 500px) {
-  body { padding: 12px; }
-  main { margin: 10px auto; }
-  .panel { padding: 16px; }
+#captionNext {font-size:18px;line-height:1.6;color:#94a3b8}
+#preview {max-height:250px;overflow:auto;white-space:pre-wrap;line-height:1.6}
+[hidden] {display:none!important}
+@media(max-width:500px) {
+  body {padding:10px}
+  main {margin:10px auto}
+  .panel {padding:16px}
+  #captionCurrent {font-size:20px}
 }
 </style>
 </head>
-
 <body>
 <main>
-
 <h1>📖 Readify</h1>
-<p class="subtitle">Your personal PDF listening companion.</p>
+<p>Listen. Follow. Learn.</p>
 
 <div class="panel">
-  <h3>Upload your document</h3>
-  <input id="upload" type="file" accept=".pdf,application/pdf">
-  <p id="status">Ready to read.</p>
+<h3>Upload a PDF</h3>
+<input type="file" id="upload" accept=".pdf,application/pdf">
+<p id="status">Ready.</p>
 </div>
 
 <div class="panel" id="reader" hidden>
+<h3 id="filename"></h3>
 
-  <h3 id="filename">Document</h3>
-  <p id="pagecount"></p>
+<div class="panel" style="background:#0f172a">
+<p id="position"></p>
+<div id="captionCurrent"></div>
+<div id="captionNext"></div>
+</div>
 
-  <div class="controls">
-    <button id="back">⏪ Back</button>
-    <button id="play" class="primary">▶ Play</button>
-    <button id="pause">⏸ Pause</button>
-    <button id="stop">⏹ Stop</button>
-    <button id="forward">⏩ Forward</button>
-  </div>
+<div class="controls">
+<button id="back">⏪ Back</button>
+<button id="play" class="primary">▶ Play</button>
+<button id="pause">⏸ Pause</button>
+<button id="stop">⏹ Stop</button>
+<button id="forward">⏩ Forward</button>
+</div>
 
-  <label>Playback speed</label>
-  <select id="speed">
-    <option value="0.75">0.75×</option>
-    <option value="1" selected>1× Normal</option>
-    <option value="1.25">1.25×</option>
-    <option value="1.5">1.5×</option>
-    <option value="1.75">1.75×</option>
-    <option value="2">2×</option>
-  </select>
+<label>Playback speed</label>
+<select id="speed">
+<option value="0.75">0.75×</option>
+<option value="1">1×</option>
+<option value="1.25">1.25×</option>
+<option value="1.5">1.5×</option>
+<option value="1.75">1.75×</option>
+<option value="2">2×</option>
+</select>
 
-  <label>Choose voice</label>
-  <select id="voice"></select>
+<label>English voices only</label>
+<select id="voice"></select>
 
-  <label>Reading progress</label>
-  <progress id="progress" value="0" max="100"></progress>
-  <p id="progressLabel">0%</p>
-
+<label>Progress</label>
+<progress id="progress" value="0" max="100"></progress>
 </div>
 
 <div class="panel">
-  <h3>Extracted text</h3>
-  <div id="content">Your PDF text will appear here.</div>
+<h3>Cleaned text</h3>
+<div id="preview">Your text will appear here.</div>
 </div>
-
 </main>
 </body>
 </html>
