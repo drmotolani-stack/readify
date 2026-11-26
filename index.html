@@ -3,304 +3,848 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Readify</title>
-<script type="module">
-import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.mjs";
-pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/build/pdf.worker.mjs";
 
-const $ = id => document.getElementById(id);
-let voices = [], sentences = [], index = 0, playing = false, paused = false, pdf = null, timer = null;
-
-function status(s) { $("status").textContent = s; }
-
-function getEnglishVoices() {
-  voices = speechSynthesis.getVoices().filter(v => /^en(-|$)/i.test(v.lang));
-  const sel = $("voice");
-  const old = sel.value;
-  sel.innerHTML = "";
-  voices.forEach((v,i) => {
-    const o = document.createElement("option");
-    o.value = i;
-    o.textContent = `${v.name} (${v.lang})`;
-    sel.appendChild(o);
-  });
-  if (voices[old]) sel.value = old;
-}
-speechSynthesis.onvoiceschanged = getEnglishVoices;
-getEnglishVoices();
-
-function cleanLine(line) {
-  return line
-    .replace(/\s+/g, " ")
-    .replace(/https?:\/\/\S+/gi, "")
-    .replace(/\bwww\.\S+/gi, "")
-    .replace(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi, "")
-    .trim();
-}
-
-function isNoise(line) {
-  if (!line) return true;
-  if (/^\d{1,4}$/.test(line)) return true;
-  if (/^(page\s*)?\d{1,4}\s*(of\s*\d{1,4})?$/i.test(line)) return true;
-  if (/https?:\/\/|www\.|@[\w.-]+\.[a-z]{2,}/i.test(line)) return true;
-  if (/^(copyright|all rights reserved|isbn)\b/i.test(line)) return true;
-  return false;
-}
-
-function isHeading(line) {
-  if (line.length > 100) return false;
-  if (/^(chapter|part|section|introduction|conclusion|preface|contents|appendix)\b/i.test(line)) return true;
-  if (line.length < 65 && line === line.toUpperCase() && /[A-Z]/.test(line)) return true;
-  if (line.length < 65 && !/[.!?]$/.test(line) && line.split(" ").length <= 8) return true;
-  return false;
-}
-
-function prepareText(pages) {
-  const allLines = pages.flatMap(p => p.split("\n").map(cleanLine));
-  const counts = {};
-  allLines.forEach(line => {
-    if (line.length > 3) counts[line.toLowerCase()] = (counts[line.toLowerCase()] || 0) + 1;
-  });
-
-  const repeated = new Set(
-    Object.keys(counts).filter(k => counts[k] >= Math.max(3, Math.ceil(pages.length * 0.25)))
-  );
-
-  const output = [];
-  pages.forEach((page, i) => {
-    const lines = page.split("\n").map(cleanLine);
-    const cleaned = lines.filter(line =>
-      !isNoise(line) && !repeated.has(line.toLowerCase())
-    );
-
-    output.push({ heading: `Page ${i+1}`, text: cleaned.join(" ") });
-  });
-
-  let text = output.map(p => p.text).join("\n\n");
-  text = text.replace(/\s+/g, " ").trim();
-
-  // Remove repeated title-like phrases at the start when possible.
-  text = text.replace(/\b(Introduction)\s+\1\b/gi, "$1");
-
-  return text;
-}
-
-function splitSentences(text) {
-  return text.match(/[^.!?]+[.!?]+(?:["')\]]*)|[^.!?]+$/g)
-    ?.map(s => s.trim()).filter(Boolean) || [];
-}
-
-function renderCaptions() {
-  const current = sentences[index] || "";
-  const next = sentences.slice(index+1, index+3).join(" ");
-  $("captionCurrent").textContent = current;
-  $("captionNext").textContent = next;
-  $("position").textContent = `Sentence ${index+1} of ${sentences.length}`;
-  $("progress").value = sentences.length ? (index / sentences.length) * 100 : 0;
-}
-
-function speak() {
-  if (!playing || index >= sentences.length) {
-    playing = false;
-    status("Finished reading.");
-    return;
-  }
-
-  renderCaptions();
-  const u = new SpeechSynthesisUtterance(sentences[index]);
-  u.rate = Number($("speed").value);
-  u.voice = voices[Number($("voice").value)] || null;
-
-  u.onend = () => {
-    if (playing && !paused) {
-      index++;
-      renderCaptions();
-      speak();
-    }
-  };
-
-  u.onerror = e => {
-    if (e.error !== "canceled" && e.error !== "interrupted") {
-      status("Speech error. Try another voice.");
-    }
-  };
-
-  speechSynthesis.speak(u);
-}
-
-function play() {
-  if (!sentences.length) return;
-  if (paused) {
-    paused = false;
-    playing = true;
-    speechSynthesis.resume();
-    status("Reading...");
-    return;
-  }
-  if (playing) return;
-  if (index >= sentences.length) index = 0;
-  playing = true;
-  status("Reading...");
-  speak();
-}
-
-function pause() {
-  paused = true;
-  playing = false;
-  speechSynthesis.pause();
-  status("Paused.");
-}
-
-function stop() {
-  playing = false;
-  paused = false;
-  speechSynthesis.cancel();
-  index = 0;
-  renderCaptions();
-  status("Stopped.");
-}
-
-function jump(n) {
-  speechSynthesis.cancel();
-  index = Math.max(0, Math.min(sentences.length-1, index+n));
-  paused = false;
-  playing = true;
-  speak();
-}
-
-$("upload").addEventListener("change", async e => {
-  const file = e.target.files[0];
-  if (!file) return;
-  stop();
-  status("Reading PDF...");
-  $("preview").innerHTML = "";
-  try {
-    pdf = await pdfjsLib.getDocument({data: new Uint8Array(await file.arrayBuffer())}).promise;
-    let pages = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      pages.push(content.items.map(i => i.str).join(" "));
-      status(`Extracting page ${p} of ${pdf.numPages}`);
-    }
-
-    const text = prepareText(pages);
-    sentences = splitSentences(text);
-    index = 0;
-    $("preview").textContent = text;
-    $("filename").textContent = file.name;
-    $("reader").hidden = false;
-    renderCaptions();
-    status("Document ready.");
-  } catch (err) {
-    console.error(err);
-    status("Unable to read this PDF.");
-  }
-});
-
-$("play").onclick = play;
-$("pause").onclick = pause;
-$("stop").onclick = stop;
-$("back").onclick = () => jump(-5);
-$("forward").onclick = () => jump(5);
-
-$("speed").onchange = () => {
-  if (playing) {
-    speechSynthesis.cancel();
-    speak();
-  }
-};
-$("voice").onchange = () => {
-  if (playing) {
-    speechSynthesis.cancel();
-    speak();
-  }
-};
-</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
 <style>
-* {box-sizing:border-box}
+:root {
+  --bg: #f5f5f2;
+  --panel: #ffffff;
+  --text: #252522;
+  --muted: #777770;
+  --accent: #426b5b;
+  --border: #e5e5df;
+}
+* { box-sizing: border-box; }
 body {
-  background:#101827;color:#f1f5f9;font-family:Arial,sans-serif;
-  margin:0;padding:20px;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
-main {max-width:800px;margin:25px auto}
-.panel {background:#1e293b;padding:20px;border-radius:14px;margin:16px 0}
-h1 {font-size:30px}
-label {display:block;margin-top:15px}
-button,select,input {
-  border-radius:8px;padding:12px;font-size:15px;
+header {
+  padding: 20px 7%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
 }
-button {background:#334155;color:white;border:0;cursor:pointer;margin:4px}
-button.primary {background:#2563eb}
-select {background:#334155;color:white;width:100%;margin-top:8px}
-.controls {display:flex;flex-wrap:wrap;justify-content:center;margin:18px 0}
-#status {color:#93c5fd}
-progress {width:100%;height:12px}
-#captionCurrent {
-  font-size:23px;line-height:1.6;color:white;font-weight:bold;
+.logo { font-size: 24px; font-weight: 750; letter-spacing: -1px; }
+.logo span { color: var(--accent); }
+header small { color: var(--muted); }
+main {
+  max-width: 1200px;
+  margin: 35px auto;
+  padding: 0 20px;
 }
-#captionNext {font-size:18px;line-height:1.6;color:#94a3b8}
-#preview {max-height:250px;overflow:auto;white-space:pre-wrap;line-height:1.6}
-[hidden] {display:none!important}
-@media(max-width:500px) {
-  body {padding:10px}
-  main {margin:10px auto}
-  .panel {padding:16px}
-  #captionCurrent {font-size:20px}
+.grid {
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 22px;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 22px;
+}
+h3 { margin-top: 0; font-size: 16px; }
+.muted { color: var(--muted); font-size: 13px; }
+input, select, button {
+  font: inherit;
+}
+input[type="file"] {
+  width: 100%;
+  font-size: 13px;
+  margin: 10px 0;
+}
+select, button {
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: white;
+  color: var(--text);
+}
+button { cursor: pointer; }
+button:hover { filter: brightness(.95); }
+.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+button:disabled { opacity: .4; cursor: not-allowed; }
+.full { width: 100%; }
+.controls { display: flex; gap: 9px; flex-wrap: wrap; }
+.controls button { flex: 1; min-width: 75px; }
+label { display: block; font-size: 13px; margin-bottom: 7px; }
+.field { margin: 18px 0; }
+.reader {
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+}
+.book-title {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 20px;
+}
+.caption-box {
+  background: #f5f7f4;
+  border-radius: 14px;
+  padding: 24px;
+  margin: 5px 0 22px;
+  min-height: 170px;
+}
+.current-sentence {
+  font-size: 22px;
+  line-height: 1.7;
+  font-weight: 600;
+}
+.context {
+  color: var(--muted);
+  line-height: 1.7;
+  font-size: 16px;
+  margin-top: 14px;
+}
+.timeline { margin: 10px 0; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+.timeline-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+}
+.progress-text {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 10px 0;
+}
+.chapter-list {
+  max-height: 250px;
+  overflow-y: auto;
+}
+.chapter {
+  width: 100%;
+  text-align: left;
+  background: white;
+  border: 1px solid var(--border);
+  margin: 5px 0;
+  padding: 12px;
+  border-radius: 9px;
+  font-size: 13px;
+}
+.chapter.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #f1f6f2;
+}
+.status {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+.footer-note {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 18px;
+}
+@media(max-width:800px) {
+  .grid { grid-template-columns: 1fr; }
+  header { padding: 17px 20px; }
+  main { margin: 20px auto; }
+  .reader { min-height: 400px; }
 }
 </style>
 </head>
+
 <body>
+
+<header>
+  <div class="logo">Read<span>ify</span></div>
+  <small>Read. Listen. Understand.</small>
+</header>
+
 <main>
-<h1>📖 Readify</h1>
-<p>Listen. Follow. Learn.</p>
+<div class="grid">
 
-<div class="panel">
-<h3>Upload a PDF</h3>
-<input type="file" id="upload" accept=".pdf,application/pdf">
-<p id="status">Ready.</p>
-</div>
+  <!-- SIDEBAR -->
+  <aside>
 
-<div class="panel" id="reader" hidden>
-<h3 id="filename"></h3>
+    <div class="panel">
+      <h3>Your book</h3>
+      <p class="muted">Upload a PDF to get started.</p>
 
-<div class="panel" style="background:#0f172a">
-<p id="position"></p>
-<div id="captionCurrent"></div>
-<div id="captionNext"></div>
-</div>
+      <input type="file" id="pdfFile" accept=".pdf,application/pdf">
 
-<div class="controls">
-<button id="back">⏪ Back</button>
-<button id="play" class="primary">▶ Play</button>
-<button id="pause">⏸ Pause</button>
-<button id="stop">⏹ Stop</button>
-<button id="forward">⏩ Forward</button>
-</div>
+      <div id="fileName" class="status">No book loaded.</div>
+      <div id="loadingStatus" class="status"></div>
+    </div>
 
-<label>Playback speed</label>
-<select id="speed">
-<option value="0.75">0.75×</option>
-<option value="1">1×</option>
-<option value="1.25">1.25×</option>
-<option value="1.5">1.5×</option>
-<option value="1.75">1.75×</option>
-<option value="2">2×</option>
-</select>
+    <div class="panel" style="margin-top:20px">
+      <h3>Reading settings</h3>
 
-<label>English voices only</label>
-<select id="voice"></select>
+      <div class="field">
+        <label for="voiceSelect">English voice</label>
+        <select id="voiceSelect" class="full">
+          <option>Loading voices...</option>
+        </select>
+      </div>
 
-<label>Progress</label>
-<progress id="progress" value="0" max="100"></progress>
-</div>
+      <div class="field">
+        <label for="speed">Reading speed</label>
+        <select id="speed" class="full">
+          <option value="0.75">0.75x</option>
+          <option value="1">1.0x</option>
+          <option value="1.25">1.25x</option>
+          <option value="1.5" selected>1.5x</option>
+          <option value="1.75">1.75x</option>
+          <option value="2">2.0x</option>
+          <option value="2.25">2.25x</option>
+          <option value="2.5">2.5x</option>
+          <option value="3">3.0x</option>
+        </select>
+      </div>
 
-<div class="panel">
-<h3>Cleaned text</h3>
-<div id="preview">Your text will appear here.</div>
+      <div class="controls">
+        <button id="backBtn" disabled>−5</button>
+        <button id="playBtn" class="primary" disabled>Play</button>
+        <button id="forwardBtn" disabled>+5</button>
+      </div>
+
+      <div class="controls" style="margin-top:10px">
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div class="status" id="speechStatus">Ready when you are.</div>
+    </div>
+
+    <div class="panel" style="margin-top:20px">
+      <h3>Chapters</h3>
+      <div class="chapter-list" id="chapterList">
+        <p class="muted">Chapters will appear here after loading a book.</p>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- READER -->
+  <section class="panel reader">
+
+    <div class="book-title" id="readerTitle">Your reading space</div>
+
+    <div class="caption-box">
+      <div class="muted" id="captionLabel">LIVE CAPTIONS</div>
+
+      <div class="current-sentence" id="currentSentence">
+        Upload a PDF to begin reading.
+      </div>
+
+      <div class="context" id="contextSentences"></div>
+    </div>
+
+    <div class="timeline">
+      <label>Reading progress</label>
+
+      <input
+        type="range"
+        id="seekBar"
+        min="0"
+        max="100"
+        value="0"
+        disabled
+      >
+
+      <div class="timeline-labels">
+        <span id="progressLabel">0%</span>
+        <span id="remainingLabel">Estimated time remaining: --</span>
+      </div>
+    </div>
+
+    <div class="progress-text" id="sentenceProgress">
+      Sentence 0 of 0
+    </div>
+
+    <div style="margin-top:auto">
+      <p class="footer-note">
+        Readify v3 · Browser-based narration
+      </p>
+    </div>
+
+  </section>
+
 </div>
 </main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// ---------- STATE ----------
+
+let sentences = [];
+let chapters = [];
+let currentIndex = 0;
+let voices = [];
+let selectedVoice = null;
+
+let isPlaying = false;
+let isPaused = false;
+let sessionId = 0;
+let currentUtterance = null;
+let loadedBookName = "";
+
+const pdfFile = document.getElementById("pdfFile");
+const voiceSelect = document.getElementById("voiceSelect");
+const speedSelect = document.getElementById("speed");
+const playBtn = document.getElementById("playBtn");
+const stopBtn = document.getElementById("stopBtn");
+const backBtn = document.getElementById("backBtn");
+const forwardBtn = document.getElementById("forwardBtn");
+const seekBar = document.getElementById("seekBar");
+
+const currentSentenceEl = document.getElementById("currentSentence");
+const contextEl = document.getElementById("contextSentences");
+const progressLabel = document.getElementById("progressLabel");
+const remainingLabel = document.getElementById("remainingLabel");
+const sentenceProgress = document.getElementById("sentenceProgress");
+const chapterList = document.getElementById("chapterList");
+const speechStatus = document.getElementById("speechStatus");
+const loadingStatus = document.getElementById("loadingStatus");
+
+// ---------- VOICES ----------
+
+function loadVoices() {
+  const allVoices = window.speechSynthesis.getVoices();
+
+  voices = allVoices.filter(v =>
+    /^en(-|$)/i.test(v.lang)
+  );
+
+  voiceSelect.innerHTML = "";
+
+  if (!voices.length) {
+    voiceSelect.innerHTML =
+      '<option value="">No English voices available</option>';
+    return;
+  }
+
+  voices.forEach((voice, index) => {
+    const option = document.createElement("option");
+    option.value = index;
+    option.textContent = voice.name + " (" + voice.lang + ")";
+    voiceSelect.appendChild(option);
+  });
+
+  // Prefer an English voice that is local, where possible.
+  let preferredIndex = voices.findIndex(v =>
+    v.lang.toLowerCase() === "en-us" && v.localService
+  );
+
+  if (preferredIndex === -1) {
+    preferredIndex = voices.findIndex(v =>
+      v.lang.toLowerCase() === "en-us"
+    );
+  }
+
+  if (preferredIndex === -1) {
+    preferredIndex = voices.findIndex(v => v.localService);
+  }
+
+  if (preferredIndex === -1) preferredIndex = 0;
+
+  voiceSelect.value = preferredIndex;
+  selectedVoice = voices[preferredIndex];
+}
+
+window.speechSynthesis.onvoiceschanged = loadVoices;
+loadVoices();
+
+voiceSelect.addEventListener("change", () => {
+  selectedVoice = voices[Number(voiceSelect.value)];
+});
+
+// ---------- PDF EXTRACTION ----------
+
+pdfFile.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  stopReading();
+
+  loadedBookName = file.name.replace(/\.pdf$/i, "");
+  document.getElementById("fileName").textContent = file.name;
+  document.getElementById("readerTitle").textContent = loadedBookName;
+
+  loadingStatus.textContent = "Extracting text from PDF...";
+
+  sentences = [];
+  chapters = [];
+  currentIndex = 0;
+
+  try {
+    const buffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data: buffer}).promise;
+
+    let pages = [];
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      loadingStatus.textContent =
+        "Extracting page " + i + " of " + pdf.numPages + "...";
+
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+
+      // Preserve approximate line breaks using item coordinates.
+      let items = content.items.filter(item =>
+        item.str && item.str.trim()
+      );
+
+      let lines = [];
+      let currentLine = [];
+      let lastY = null;
+
+      items.forEach(item => {
+        const y = item.transform[5];
+
+        if (lastY !== null && Math.abs(y - lastY) > 4) {
+          if (currentLine.length) lines.push(currentLine.join(" "));
+          currentLine = [];
+        }
+
+        currentLine.push(item.str);
+        lastY = y;
+      });
+
+      if (currentLine.length) lines.push(currentLine.join(" "));
+
+      pages.push(lines.join("\n"));
+    }
+
+    // Remove repeated headers/footers across pages.
+    pages = cleanPages(pages);
+
+    const fullText = pages.join("\n\n");
+
+    sentences = splitIntoSentences(fullText);
+
+    if (!sentences.length) {
+      loadingStatus.textContent =
+        "No readable text found. This PDF may be scanned.";
+      return;
+    }
+
+    chapters = detectChapters(sentences);
+
+    currentIndex = 0;
+
+    updateUI();
+    renderChapters();
+
+    playBtn.disabled = false;
+    stopBtn.disabled = false;
+    backBtn.disabled = false;
+    forwardBtn.disabled = false;
+    seekBar.disabled = false;
+
+    loadingStatus.textContent =
+      "Loaded " + pdf.numPages + " pages · " +
+      sentences.length + " sentences.";
+
+    speechStatus.textContent = "Ready to read.";
+
+  } catch (err) {
+    console.error(err);
+    loadingStatus.textContent =
+      "Unable to read this PDF. Please try another file.";
+  }
+});
+
+// ---------- CLEANING ----------
+
+function cleanPages(pages) {
+  if (pages.length < 3) return pages;
+
+  // Identify recurring lines across pages.
+  const counts = {};
+
+  pages.forEach(page => {
+    const lines = page.split("\n");
+
+    lines.forEach(line => {
+      const normalized = normalizeLine(line);
+      if (normalized.length < 3) return;
+
+      counts[normalized] = (counts[normalized] || 0) + 1;
+    });
+  });
+
+  const repeated = Object.keys(counts).filter(line =>
+    counts[line] >= Math.max(3, Math.ceil(pages.length * 0.3))
+  );
+
+  return pages.map(page => {
+    return page.split("\n").filter(line => {
+      const normalized = normalizeLine(line);
+
+      if (!normalized) return false;
+      if (repeated.includes(normalized)) return false;
+
+      // Remove standalone page numbers.
+      if (/^\s*(page\s*)?\d{1,5}\s*$/i.test(line)) return false;
+
+      // Remove common URLs.
+      if (/^\s*(https?:\/\/|www\.)\S+\s*$/i.test(line)) return false;
+
+      return true;
+    }).join("\n");
+  });
+}
+
+function normalizeLine(line) {
+  return line
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "")
+    .trim();
+}
+
+// ---------- SENTENCE SPLITTING ----------
+
+function splitIntoSentences(text) {
+  text = text
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n");
+
+  // Merge broken lines within paragraphs.
+  text = text.replace(/([^\n])\n([^\n])/g, "$1 $2");
+
+  text = text.replace(/\n+/g, "\n\n");
+
+  const parts = text.match(
+    /[^.!?]+(?:[.!?]+["'”’)]*|$)/g
+  ) || [];
+
+  return parts.map(s => s.trim()).filter(s => s.length > 1);
+}
+
+// ---------- CHAPTER DETECTION ----------
+
+function detectChapters(textArray) {
+  const found = [];
+
+  const patterns = [
+    /^chapter\s+[\w\d]+.*$/i,
+    /^part\s+[\w\d]+.*$/i,
+    /^section\s+[\w\d]+.*$/i,
+    /^prologue$/i,
+    /^epilogue$/i,
+    /^introduction$/i,
+    /^conclusion$/i
+  ];
+
+  textArray.forEach((sentence, index) => {
+    const trimmed = sentence.trim();
+
+    if (patterns.some(p => p.test(trimmed))) {
+      found.push({
+        title: trimmed,
+        index
+      });
+    }
+  });
+
+  if (!found.length) {
+    found.push({
+      title: "Beginning",
+      index: 0
+    });
+  }
+
+  return found;
+}
+
+function renderChapters() {
+  chapterList.innerHTML = "";
+
+  chapters.forEach((chapter, index) => {
+    const button = document.createElement("button");
+    button.className = "chapter";
+    button.textContent = chapter.title;
+
+    button.onclick = () => {
+      jumpTo(chapter.index);
+
+      document.querySelectorAll(".chapter").forEach(el =>
+        el.classList.remove("active")
+      );
+
+      button.classList.add("active");
+    };
+
+    chapterList.appendChild(button);
+  });
+}
+
+// ---------- PLAYBACK ----------
+
+function playReading() {
+  if (!sentences.length) return;
+
+  if (isPaused) {
+    window.speechSynthesis.resume();
+    isPaused = false;
+    isPlaying = true;
+    playBtn.textContent = "Pause";
+    speechStatus.textContent = "Reading...";
+    return;
+  }
+
+  startFrom(currentIndex);
+}
+
+function startFrom(index) {
+  if (!sentences.length) return;
+
+  index = Math.max(0, Math.min(index, sentences.length - 1));
+
+  sessionId++;
+  const mySession = sessionId;
+
+  window.speechSynthesis.cancel();
+
+  currentIndex = index;
+  isPlaying = true;
+  isPaused = false;
+
+  playBtn.textContent = "Pause";
+  speechStatus.textContent = "Reading...";
+
+  speakSentence(mySession);
+}
+
+function speakSentence(mySession) {
+  if (mySession !== sessionId) return;
+
+  if (currentIndex >= sentences.length) {
+    finishReading();
+    return;
+  }
+
+  updateUI();
+
+  const utterance = new SpeechSynthesisUtterance(
+    sentences[currentIndex]
+  );
+
+  currentUtterance = utterance;
+
+  utterance.rate = Number(speedSelect.value);
+  utterance.pitch = 1;
+  utterance.volume = 1;
+
+  if (selectedVoice) utterance.voice = selectedVoice;
+
+  utterance.onend = () => {
+    if (mySession !== sessionId || !isPlaying) return;
+
+    currentIndex++;
+
+    if (currentIndex >= sentences.length) {
+      finishReading();
+      return;
+    }
+
+    speakSentence(mySession);
+  };
+
+  utterance.onerror = (event) => {
+    if (mySession !== sessionId) return;
+
+    // Ignore cancellation errors from deliberate stopping/restarting.
+    if (event.error === "canceled" || event.error === "interrupted") return;
+
+    speechStatus.textContent =
+      "Speech issue. Try another voice or restart.";
+  };
+
+  window.speechSynthesis.speak(utterance);
+}
+
+function pauseReading() {
+  if (!isPlaying) return;
+
+  window.speechSynthesis.pause();
+  isPaused = true;
+  isPlaying = false;
+
+  playBtn.textContent = "Resume";
+  speechStatus.textContent = "Paused.";
+}
+
+function finishReading() {
+  sessionId++;
+  isPlaying = false;
+  isPaused = false;
+
+  window.speechSynthesis.cancel();
+
+  playBtn.textContent = "Play";
+  speechStatus.textContent = "Finished reading.";
+
+  currentIndex = sentences.length - 1;
+  updateUI();
+}
+
+function stopReading() {
+  sessionId++;
+
+  window.speechSynthesis.cancel();
+
+  isPlaying = false;
+  isPaused = false;
+
+  playBtn.textContent = "Play";
+  speechStatus.textContent = "Stopped.";
+
+  currentUtterance = null;
+}
+
+playBtn.addEventListener("click", () => {
+  if (isPlaying) {
+    pauseReading();
+  } else {
+    playReading();
+  }
+});
+
+stopBtn.addEventListener("click", stopReading);
+
+// ---------- NAVIGATION ----------
+
+function jumpTo(index) {
+  startFrom(index);
+}
+
+backBtn.addEventListener("click", () => {
+  jumpTo(currentIndex - 5);
+});
+
+forwardBtn.addEventListener("click", () => {
+  jumpTo(currentIndex + 5);
+});
+
+seekBar.addEventListener("input", () => {
+  const index = Math.round(
+    (Number(seekBar.value) / 100) * (sentences.length - 1)
+  );
+
+  currentIndex = index;
+  isPlaying = false;
+  isPaused = false;
+
+  sessionId++;
+  window.speechSynthesis.cancel();
+
+  playBtn.textContent = "Play";
+  speechStatus.textContent = "Position changed.";
+
+  updateUI();
+});
+
+speedSelect.addEventListener("change", () => {
+  if (isPlaying) {
+    startFrom(currentIndex);
+  }
+});
+
+// ---------- UI ----------
+
+function updateUI() {
+  if (!sentences.length) return;
+
+  currentIndex = Math.max(
+    0,
+    Math.min(currentIndex, sentences.length - 1)
+  );
+
+  currentSentenceEl.textContent = sentences[currentIndex];
+
+  const nearby = [];
+
+  for (let i = currentIndex + 1; i < Math.min(sentences.length, currentIndex + 4); i++) {
+    nearby.push(sentences[i]);
+  }
+
+  contextEl.textContent = nearby.join(" ");
+
+  const percentage = Math.round(
+    (currentIndex / Math.max(1, sentences.length - 1)) * 100
+  );
+
+  seekBar.value = percentage;
+
+  progressLabel.textContent = percentage + "%";
+
+  sentenceProgress.textContent =
+    "Sentence " + (currentIndex + 1) +
+    " of " + sentences.length;
+
+  const remainingWords = sentences
+    .slice(currentIndex)
+    .join(" ")
+    .split(/\s+/)
+    .filter(Boolean).length;
+
+  // Approximate natural speech baseline of 150 words/min.
+  const baselineWPM = 150;
+  const rate = Number(speedSelect.value);
+
+  const estimatedMinutes = Math.ceil(
+    remainingWords / (baselineWPM * rate)
+  );
+
+  remainingLabel.textContent =
+    "Estimated time remaining: " +
+    formatTime(estimatedMinutes);
+
+  // Highlight current chapter.
+  const chapterIndex = chapters.findIndex((c, i) => {
+    const next = chapters[i + 1];
+    return currentIndex >= c.index &&
+      (!next || currentIndex < next.index);
+  });
+
+  const chapterButtons = document.querySelectorAll(".chapter");
+
+  chapterButtons.forEach((button, i) => {
+    button.classList.toggle("active", i === chapterIndex);
+  });
+}
+
+function formatTime(minutes) {
+  if (minutes < 1) return "Less than 1 min";
+
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+
+  if (hours > 0) return hours + "h " + mins + "m";
+
+  return mins + " min";
+}
+
+// ---------- INITIAL UI ----------
+
+seekBar.disabled = true;
+playBtn.disabled = true;
+stopBtn.disabled = true;
+backBtn.disabled = true;
+forwardBtn.disabled = true;
+
+</script>
+
 </body>
 </html>
