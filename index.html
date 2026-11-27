@@ -119,9 +119,9 @@ main{margin:20px auto}
       <label for="speed">Reading speed</label>
       <select id="speed" class="full">
         <option value="0.75">0.75x</option>
-        <option value="1">1.0x</option>
+        <option value="1" selected>1.0x</option>
         <option value="1.25">1.25x</option>
-        <option value="1.5" selected>1.5x</option>
+        <option value="1.5">1.5x</option>
         <option value="1.75">1.75x</option>
         <option value="2">2.0x</option>
         <option value="2.25">2.25x</option>
@@ -197,6 +197,11 @@ let isPaused = false;
 let sessionId = 0;
 let usingCleanText = false;
 let currentBookName = "";
+let currentAudio = null;
+let ttsAbortController = null;
+let ttsFallbackForSession = false;
+const ttsCache = new Map();
+const GEMINI_VOICES = ["Kore", "Puck", "Charon", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr"];
 
 // ---------- ELEMENTS ----------
 
@@ -221,39 +226,42 @@ function loadVoices() {
 
   voiceSelect.innerHTML = "";
 
-  if (!voices.length) {
-    voiceSelect.innerHTML =
-      '<option value="">No English voices available</option>';
-    return;
-  }
+  const geminiGroup = document.createElement("optgroup");
+  geminiGroup.label = "Gemini AI voices";
+  GEMINI_VOICES.forEach(name => {
+    const option = document.createElement("option");
+    option.value = `gemini:${name}`;
+    option.textContent = `Gemini · ${name}`;
+    geminiGroup.appendChild(option);
+  });
+  voiceSelect.appendChild(geminiGroup);
 
+  const browserGroup = document.createElement("optgroup");
+  browserGroup.label = "Browser voices (fallback)";
   voices.forEach((voice, index) => {
     const option = document.createElement("option");
-    option.value = index;
+    option.value = `browser:${index}`;
     option.textContent = `${voice.name} (${voice.lang})`;
-    voiceSelect.appendChild(option);
+    browserGroup.appendChild(option);
   });
 
-  let preferred = voices.findIndex(v =>
-    v.lang.toLowerCase() === "en-us" && v.localService
-  );
+  if (voices.length) voiceSelect.appendChild(browserGroup);
 
-  if (preferred < 0) preferred = voices.findIndex(v =>
-    v.lang.toLowerCase() === "en-us"
-  );
-
-  if (preferred < 0) preferred = voices.findIndex(v => v.localService);
-  if (preferred < 0) preferred = 0;
-
-  voiceSelect.value = preferred;
-  selectedVoice = voices[preferred];
+  if (!voiceSelect.value || !voiceSelect.value.startsWith("gemini:")) {
+    voiceSelect.value = "gemini:Kore";
+  }
+  selectedVoice = voices[0] || null;
 }
 
 speechSynthesis.onvoiceschanged = loadVoices;
 loadVoices();
 
 voiceSelect.addEventListener("change", () => {
-  selectedVoice = voices[Number(voiceSelect.value)];
+  const value = voiceSelect.value;
+  if (value.startsWith("browser:")) {
+    selectedVoice = voices[Number(value.split(":")[1])] || null;
+  }
+  if (sentences.length && isPlaying) startFrom(currentIndex);
 });
 
 // ---------- PDF EXTRACTION ----------
@@ -625,15 +633,36 @@ function renderChapters() {
 
 // ---------- SPEECH ----------
 
+function stopGeminiAudio() {
+  if (ttsAbortController) {
+    ttsAbortController.abort();
+    ttsAbortController = null;
+  }
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.onended = null;
+    currentAudio.onerror = null;
+    currentAudio = null;
+  }
+}
+
 function playReading() {
   if (!sentences.length) return;
 
   if (isPaused) {
-    speechSynthesis.resume();
     isPaused = false;
     isPlaying = true;
     playBtn.textContent = "Pause";
     $("speechStatus").textContent = "Reading...";
+
+    if (currentAudio) {
+      currentAudio.play().catch(error => {
+        console.error(error);
+        $("speechStatus").textContent = "Unable to resume audio. Press Play to retry.";
+      });
+    } else {
+      startFrom(currentIndex);
+    }
     return;
   }
 
@@ -643,21 +672,24 @@ function playReading() {
 function startFrom(index) {
   if (!sentences.length) return;
 
-  index = Math.max(0,Math.min(index,sentences.length-1));
+  index = Math.max(0, Math.min(index, sentences.length - 1));
   sessionId++;
   const mySession = sessionId;
 
   speechSynthesis.cancel();
+  stopGeminiAudio();
+
   currentIndex = index;
   isPlaying = true;
   isPaused = false;
+  ttsFallbackForSession = false;
   playBtn.textContent = "Pause";
-  $("speechStatus").textContent = "Reading...";
+  $("speechStatus").textContent = "Preparing audio...";
   speakSentence(mySession);
 }
 
 function speakSentence(mySession) {
-  if (mySession !== sessionId) return;
+  if (mySession !== sessionId || !isPlaying) return;
 
   if (currentIndex >= sentences.length) {
     finishReading();
@@ -665,6 +697,17 @@ function speakSentence(mySession) {
   }
 
   updateUI();
+
+  const choice = voiceSelect.value || "gemini:Kore";
+  if (choice.startsWith("browser:") || ttsFallbackForSession) {
+    speakBrowserSentence(mySession);
+  } else {
+    speakGeminiSentence(mySession, choice.slice("gemini:".length));
+  }
+}
+
+function speakBrowserSentence(mySession) {
+  if (mySession !== sessionId || !isPlaying) return;
 
   const utterance = new SpeechSynthesisUtterance(sentences[currentIndex]);
   utterance.rate = Number(speedSelect.value);
@@ -676,30 +719,133 @@ function speakSentence(mySession) {
   utterance.onend = () => {
     if (mySession !== sessionId || !isPlaying) return;
     currentIndex++;
-    if (currentIndex >= sentences.length) {
-      finishReading();
-      return;
-    }
     speakSentence(mySession);
   };
 
   utterance.onerror = event => {
     if (mySession !== sessionId) return;
     if (event.error === "canceled" || event.error === "interrupted") return;
-    $("speechStatus").textContent =
-      "Speech issue. Try another voice or restart.";
+    $("speechStatus").textContent = "Speech issue. Try another voice or restart.";
   };
 
+  $("speechStatus").textContent = ttsFallbackForSession
+    ? "Gemini unavailable. Continuing with browser voice."
+    : "Reading with browser voice...";
   speechSynthesis.speak(utterance);
+}
+
+function splitLongSentence(text, maxLength = 3500) {
+  const words = text.split(/\s+/);
+  const parts = [];
+  let part = "";
+
+  for (const word of words) {
+    if (part && (part.length + word.length + 1 > maxLength)) {
+      parts.push(part);
+      part = word;
+    } else {
+      part += (part ? " " : "") + word;
+    }
+  }
+  if (part) parts.push(part);
+  return parts;
+}
+
+async function getGeminiAudio(text, voice, mySession) {
+  const cacheKey = `${voice}::${text}`;
+  if (ttsCache.has(cacheKey)) return ttsCache.get(cacheKey);
+
+  const controller = new AbortController();
+  ttsAbortController = controller;
+
+  const response = await fetch(`${AI_ENDPOINT}tts`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text, voice}),
+    signal: controller.signal
+  });
+
+  const data = await response.json();
+  if (!response.ok || !data.audioBase64) {
+    throw new Error(data.error || data.details || "Gemini voice request failed.");
+  }
+  if (mySession !== sessionId) throw new DOMException("Playback changed", "AbortError");
+
+  const audioUrl = `data:${data.mimeType || "audio/wav"};base64,${data.audioBase64}`;
+  ttsCache.set(cacheKey, audioUrl);
+
+  // Keep the in-memory cache bounded.
+  if (ttsCache.size > 30) {
+    ttsCache.delete(ttsCache.keys().next().value);
+  }
+  return audioUrl;
+}
+
+async function speakGeminiSentence(mySession, voice) {
+  if (mySession !== sessionId || !isPlaying) return;
+
+  const parts = splitLongSentence(sentences[currentIndex]);
+  $("speechStatus").textContent = "Generating Gemini audio...";
+
+  try {
+    for (const part of parts) {
+      if (mySession !== sessionId || !isPlaying) return;
+
+      const audioUrl = await getGeminiAudio(part, voice, mySession);
+      if (mySession !== sessionId || !isPlaying) return;
+
+      ttsAbortController = null;
+      await new Promise((resolve, reject) => {
+        const audio = new Audio(audioUrl);
+        currentAudio = audio;
+        audio.playbackRate = Number(speedSelect.value);
+
+        audio.onended = () => {
+          if (currentAudio === audio) currentAudio = null;
+          resolve();
+        };
+        audio.onerror = () => {
+          if (currentAudio === audio) currentAudio = null;
+          reject(new Error("The generated audio could not be played."));
+        };
+
+        $("speechStatus").textContent = `Reading with Gemini · ${voice}`;
+        audio.play().catch(reject);
+      });
+    }
+
+    if (mySession !== sessionId || !isPlaying) return;
+    currentIndex++;
+    speakSentence(mySession);
+
+  } catch (error) {
+    if (error.name === "AbortError" || mySession !== sessionId) return;
+
+    console.error("Gemini TTS error:", error);
+    ttsFallbackForSession = true;
+    $("speechStatus").textContent =
+      "Gemini voice unavailable. Switching to browser voice for the rest of this session.";
+    speakBrowserSentence(mySession);
+  }
 }
 
 function pauseReading() {
   if (!isPlaying) return;
-  speechSynthesis.pause();
+
   isPaused = true;
   isPlaying = false;
   playBtn.textContent = "Resume";
   $("speechStatus").textContent = "Paused.";
+
+  if (currentAudio) {
+    currentAudio.pause();
+  } else if (ttsAbortController) {
+    // If audio is still being generated, cancel the request.
+    ttsAbortController.abort();
+    ttsAbortController = null;
+  } else {
+    speechSynthesis.pause();
+  }
 }
 
 function finishReading() {
@@ -707,18 +853,22 @@ function finishReading() {
   isPlaying = false;
   isPaused = false;
   speechSynthesis.cancel();
+  stopGeminiAudio();
   playBtn.textContent = "Play";
   $("speechStatus").textContent = "Finished reading.";
-  currentIndex = sentences.length-1;
+  currentIndex = sentences.length - 1;
   updateUI();
 }
 
 function stopReading() {
   sessionId++;
   speechSynthesis.cancel();
+  stopGeminiAudio();
   isPlaying = false;
   isPaused = false;
+  ttsFallbackForSession = false;
   playBtn.textContent = "Play";
+  $("speechStatus").textContent = "Stopped.";
 }
 
 playBtn.addEventListener("click", () => {
@@ -728,15 +878,19 @@ playBtn.addEventListener("click", () => {
 
 stopBtn.addEventListener("click", stopReading);
 
-backBtn.addEventListener("click", () => jumpTo(currentIndex-5));
-forwardBtn.addEventListener("click", () => jumpTo(currentIndex+5));
+backBtn.addEventListener("click", () => jumpTo(currentIndex - 5));
+forwardBtn.addEventListener("click", () => jumpTo(currentIndex + 5));
 
 function jumpTo(index) {
   startFrom(index);
 }
 
 speedSelect.addEventListener("change", () => {
-  if (isPlaying) startFrom(currentIndex);
+  if (currentAudio) {
+    currentAudio.playbackRate = Number(speedSelect.value);
+  } else if (isPlaying && voiceSelect.value.startsWith("browser:")) {
+    startFrom(currentIndex);
+  }
 });
 
 // ---------- SEEKING ----------
@@ -750,6 +904,7 @@ seekBar.addEventListener("input", () => {
 
   sessionId++;
   speechSynthesis.cancel();
+  stopGeminiAudio();
   isPlaying = false;
   isPaused = false;
   playBtn.textContent = "Play";
