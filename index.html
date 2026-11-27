@@ -6,6 +6,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Readify</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.9.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 :root {
   --bg:#f5f5f2;--panel:#fff;--text:#252522;
@@ -82,9 +84,9 @@ main{margin:20px auto}
 <aside>
 
   <div class="panel">
-    <h3>Your book</h3>
-    <p class="muted">Upload a PDF to get started.</p>
-    <input type="file" id="pdfFile" accept=".pdf,application/pdf">
+    <h3>Your document</h3>
+    <p class="muted">Upload a PDF, Word document or EPUB ebook.</p>
+    <input type="file" id="pdfFile" accept=".pdf,.docx,.epub,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/epub+zip">
     <div id="fileName" class="status">No book loaded.</div>
     <div id="loadingStatus" class="status"></div>
   </div>
@@ -156,7 +158,7 @@ main{margin:20px auto}
   <div class="caption-box">
     <div class="muted">LIVE CAPTIONS</div>
     <div class="current-sentence" id="currentSentence">
-      Upload a PDF to begin reading.
+      Upload a PDF, DOCX or EPUB to begin reading.
     </div>
     <div class="context" id="contextSentences"></div>
   </div>
@@ -189,6 +191,7 @@ let originalText = "";
 let cleanedText = "";
 let sentences = [];
 let chapters = [];
+let cleanedChapters = [];
 let currentIndex = 0;
 let voices = [];
 let selectedVoice = null;
@@ -207,7 +210,7 @@ const GEMINI_VOICES = ["Kore", "Puck", "Charon", "Fenrir", "Aoede", "Leda", "Oru
 
 const $ = id => document.getElementById(id);
 
-const pdfFile = $("pdfFile");
+const documentFile = $("pdfFile");
 const voiceSelect = $("voiceSelect");
 const speedSelect = $("speed");
 const playBtn = $("playBtn");
@@ -264,90 +267,169 @@ voiceSelect.addEventListener("change", () => {
   if (sentences.length && isPlaying) startFrom(currentIndex);
 });
 
-// ---------- PDF EXTRACTION ----------
+// ---------- DOCUMENT EXTRACTION: PDF, DOCX AND EPUB ----------
 
-pdfFile.addEventListener("change", async event => {
+documentFile.addEventListener("change", async event => {
   const file = event.target.files[0];
   if (!file) return;
 
   stopReading();
-
-  currentBookName = file.name.replace(/\.pdf$/i, "");
+  currentBookName = file.name.replace(/\.(pdf|docx|epub)$/i, "");
   $("fileName").textContent = file.name;
   $("readerTitle").textContent = currentBookName;
-  $("loadingStatus").textContent = "Extracting PDF text...";
-
+  $("loadingStatus").textContent = "Preparing document...";
   originalText = "";
   cleanedText = "";
   sentences = [];
   chapters = [];
+  cleanedChapters = [];
   currentIndex = 0;
   usingCleanText = false;
-
   aiStatus.classList.remove("visible");
   $("originalMode").classList.add("selected");
   $("cleanMode").classList.remove("selected");
+  $("cleanMode").disabled = true;
 
   try {
-    const buffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({data:buffer}).promise;
-    let pages = [];
-
-    for (let i = 1; i <= pdf.numPages; i++) {
-      $("loadingStatus").textContent =
-        `Extracting page ${i} of ${pdf.numPages}...`;
-
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      const items = content.items.filter(x => x.str && x.str.trim());
-
-      let lines = [];
-      let currentLine = [];
-      let lastY = null;
-
-      items.forEach(item => {
-        const y = item.transform[5];
-
-        if (lastY !== null && Math.abs(y-lastY) > 4) {
-          if (currentLine.length) lines.push(currentLine.join(" "));
-          currentLine = [];
-        }
-
-        currentLine.push(item.str);
-        lastY = y;
-      });
-
-      if (currentLine.length) lines.push(currentLine.join(" "));
-      pages.push(lines.join("\n"));
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (ext === "pdf") {
+      originalText = await extractPdfText(file);
+    } else if (ext === "docx") {
+      originalText = await extractDocxText(file);
+    } else if (ext === "epub") {
+      originalText = await extractEpubText(file);
+    } else {
+      throw new Error("Unsupported file type. Choose PDF, DOCX or EPUB.");
     }
 
-    pages = cleanPages(pages);
-    originalText = pages.join("\n\n");
+    originalText = normaliseExtractedText(originalText);
+    if (!originalText.trim()) {
+      throw new Error(ext === "pdf"
+        ? "No selectable text found. This may be a scanned PDF; OCR is not yet supported."
+        : "No readable text was found in this document.");
+    }
 
     sentences = splitIntoSentences(originalText);
     chapters = detectChapters(sentences);
-
-    if (!sentences.length) {
-      $("loadingStatus").textContent =
-        "No readable text found. This PDF may be scanned.";
-      return;
-    }
-
     enableReader();
-
-    $("loadingStatus").textContent =
-      `Loaded ${pdf.numPages} pages · ${sentences.length} sentences.`;
-
+    $("loadingStatus").textContent = `Loaded ${ext.toUpperCase()} · ${sentences.length} sentences.`;
     $("speechStatus").textContent = "Ready to read.";
     renderChapters();
     updateUI();
-
   } catch(error) {
-    console.error(error);
-    $("loadingStatus").textContent =
-      "Unable to read this PDF. Please try another file.";
+    console.error("Document extraction failed:", error);
+    $("loadingStatus").textContent = error.message || "Unable to read this document.";
   }
 });
+
+async function extractPdfText(file) {
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data:buffer}).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    $("loadingStatus").textContent = `Extracting PDF page ${i} of ${pdf.numPages}...`;
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const items = content.items.filter(x => x.str && x.str.trim());
+    const lines = [];
+    let currentLine = [];
+    let lastY = null;
+    let lastX = null;
+    items.forEach(item => {
+      const x = item.transform[4];
+      const y = item.transform[5];
+      if (lastY !== null && (Math.abs(y-lastY) > 3 || (lastX !== null && x < lastX - 5))) {
+        if (currentLine.length) lines.push(currentLine.join(" ").trim());
+        currentLine = [];
+      }
+      currentLine.push(item.str);
+      lastY = y;
+      lastX = x + (item.width || 0);
+    });
+    if (currentLine.length) lines.push(currentLine.join(" ").trim());
+    pages.push(lines.join("\n"));
+  }
+  return cleanPages(pages).join("\n\n");
+}
+
+async function extractDocxText(file) {
+  if (!window.mammoth) throw new Error("The DOCX reader library did not load. Refresh and try again.");
+  $("loadingStatus").textContent = "Extracting Word document...";
+  const result = await mammoth.convertToHtml({arrayBuffer: await file.arrayBuffer()});
+  const text = htmlToReadableText(result.value);
+  if (result.messages?.length) console.info("DOCX extraction notes:", result.messages);
+  return text;
+}
+
+async function extractEpubText(file) {
+  if (!window.JSZip) throw new Error("The EPUB reader library did not load. Refresh and try again.");
+  $("loadingStatus").textContent = "Opening EPUB ebook...";
+  const zip = await JSZip.loadAsync(file);
+  const containerFile = zip.file("META-INF/container.xml");
+  if (!containerFile) throw new Error("This EPUB is missing its container.xml file.");
+  const containerXml = new DOMParser().parseFromString(await containerFile.async("text"), "application/xml");
+  const rootfile = containerXml.querySelector("rootfile");
+  const opfPath = rootfile?.getAttribute("full-path");
+  if (!opfPath) throw new Error("Could not locate the EPUB package document.");
+  const opfFile = zip.file(opfPath);
+  if (!opfFile) throw new Error("The EPUB package document could not be opened.");
+  const opf = new DOMParser().parseFromString(await opfFile.async("text"), "application/xml");
+  const manifest = new Map();
+  opf.querySelectorAll("manifest item").forEach(item => {
+    manifest.set(item.getAttribute("id"), item.getAttribute("href"));
+  });
+  const basePath = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/")+1) : "";
+  const sections = [];
+  const spineItems = [...opf.querySelectorAll("spine itemref")];
+  for (let i = 0; i < spineItems.length; i++) {
+    $("loadingStatus").textContent = `Extracting EPUB section ${i+1} of ${spineItems.length}...`;
+    const href = manifest.get(spineItems[i].getAttribute("idref"));
+    if (!href) continue;
+    const path = resolveZipPath(basePath, decodeURIComponent(href.split("#")[0]));
+    const entry = zip.file(path);
+    if (!entry) continue;
+    const markup = await entry.async("text");
+    const sectionText = htmlToReadableText(markup);
+    if (sectionText.trim()) sections.push(sectionText.trim());
+  }
+  if (!sections.length) throw new Error("No readable chapters were found in this EPUB.");
+  return sections.join("\n\n");
+}
+
+function resolveZipPath(base, relative) {
+  const parts = (base + relative).split("/");
+  const out = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") out.pop(); else out.push(part);
+  }
+  return out.join("/");
+}
+
+function htmlToReadableText(markup) {
+  const doc = new DOMParser().parseFromString(markup, "text/html");
+  doc.querySelectorAll("script,style,svg,nav,aside,header,footer,noscript").forEach(n => n.remove());
+  const root = doc.body || doc.documentElement;
+  const blockTags = new Set(["P","DIV","SECTION","ARTICLE","H1","H2","H3","H4","H5","H6","LI","BLOCKQUOTE","PRE","TR"]);
+  function walk(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+    const tag = node.tagName;
+    if (tag === "BR") return "\n";
+    const children = [...node.childNodes].map(walk).join("");
+    if (tag === "LI") return "• " + children.trim() + "\n";
+    if (tag === "TR") return children.trim() + "\n";
+    if (blockTags.has(tag)) return children.trim() + "\n\n";
+    return children;
+  }
+  return walk(root).replace(/[ \t]+\n/g,"\n").replace(/\n[ \t]+/g,"\n").replace(/\n{3,}/g,"\n\n").trim();
+}
+
+function normaliseExtractedText(text) {
+  return String(text || "").replace(/\u00a0/g," ").replace(/[\u200b\ufeff]/g,"")
+    .replace(/[ \t]+\n/g,"\n").replace(/\n[ \t]+/g,"\n")
+    .replace(/\n{3,}/g,"\n\n").trim();
+}
 
 function cleanPages(pages) {
   if (pages.length < 3) return pages;
@@ -380,125 +462,104 @@ function normalizeLine(line) {
 }
 
 // ---------- AI CLEANING ----------
+// Keep requests deliberately small to stay below Groq's TPM ceiling.
+// Paragraphs/sentences are kept intact wherever possible.
 
-// Split at paragraph boundaries, keeping each request below
-// the 18,000-character Worker limit.
-
-function makeChunks(text, maxLength = 14000) {
-  const paragraphs = text.split(/\n\s*\n/);
+function makeChunks(text, maxLength = 2500) {
+  const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
   const chunks = [];
   let current = "";
-
+  const pushCurrent = () => { if (current.trim()) chunks.push(current.trim()); current = ""; };
   for (const paragraph of paragraphs) {
-    if (paragraph.length > maxLength) {
-      if (current) {
-        chunks.push(current);
-        current = "";
-      }
-
-      for (let i = 0; i < paragraph.length; i += maxLength) {
-        chunks.push(paragraph.slice(i, i + maxLength));
-      }
+    if (paragraph.length <= maxLength) {
+      if (current && current.length + paragraph.length + 2 > maxLength) pushCurrent();
+      current += (current ? "\n\n" : "") + paragraph;
       continue;
     }
-
-    if (current.length + paragraph.length + 2 > maxLength) {
-      if (current) chunks.push(current);
-      current = paragraph;
-    } else {
-      current += (current ? "\n\n" : "") + paragraph;
+    pushCurrent();
+    const units = paragraph.match(/[^.!?]+(?:[.!?]+["'”’)]*|$)/g) || [paragraph];
+    for (const unitRaw of units) {
+      const unit = unitRaw.trim();
+      if (!unit) continue;
+      if (unit.length > maxLength) {
+        const words = unit.split(/\s+/);
+        let piece = "";
+        for (const word of words) {
+          if (piece && piece.length + word.length + 1 > maxLength) { chunks.push(piece); piece = ""; }
+          piece += (piece ? " " : "") + word;
+        }
+        if (piece) chunks.push(piece);
+      } else if (current && current.length + unit.length + 1 > maxLength) {
+        pushCurrent(); current = unit;
+      } else {
+        current += (current ? " " : "") + unit;
+      }
     }
+    pushCurrent();
   }
-
-  if (current) chunks.push(current);
+  pushCurrent();
   return chunks;
 }
 
-async function callAI(text) {
+async function callAI(text, providerHint = "auto") {
   const response = await fetch(AI_ENDPOINT, {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({text})
+    body: JSON.stringify({text, providerHint})
   });
-
-  const data = await response.json();
-
+  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.details || data.error || "AI request failed.");
+    const details = Array.isArray(data.details) ? data.details.join("; ") : data.details;
+    throw new Error(details || data.error || `AI request failed (${response.status}).`);
   }
-
-  if (!data.result || typeof data.result.cleanedText !== "string") {
-    throw new Error("AI returned an unexpected response.");
+  if (!data.result || typeof data.result.cleanedText !== "string" || !data.result.cleanedText.trim()) {
+    throw new Error("AI returned an empty or unexpected cleaning result.");
   }
-
-  return data.result;
+  return data;
 }
 
 aiButton.addEventListener("click", async () => {
   if (!originalText || aiButton.disabled) return;
-
   stopReading();
-
   aiButton.disabled = true;
   aiButton.textContent = "AI processing...";
   aiStatus.classList.add("visible");
-
-  const chunks = makeChunks(originalText);
+  const chunks = makeChunks(originalText, 2500);
   const cleanedParts = [];
   const detectedChapters = [];
   const notes = [];
-
+  let providerHint = "auto";
   try {
     for (let i = 0; i < chunks.length; i++) {
-      aiStatus.textContent =
-        `AI is cleaning section ${i+1} of ${chunks.length}. Please keep this page open.`;
-
-      const result = await callAI(chunks[i]);
-
+      aiStatus.textContent = `Cleaning section ${i+1} of ${chunks.length} · ${providerHint === "auto" ? "Groq with Gemini fallback" : providerHint}...`;
+      const response = await callAI(chunks[i], providerHint);
+      const result = response.result;
       cleanedParts.push(result.cleanedText.trim());
-
-      if (Array.isArray(result.chapters)) {
-        detectedChapters.push(...result.chapters);
-      }
-
+      if (response.provider === "Gemini") providerHint = "Gemini";
+      if (Array.isArray(result.chapters)) detectedChapters.push(...result.chapters);
       if (result.notes) notes.push(result.notes);
+      if (i < chunks.length - 1) await new Promise(resolve => setTimeout(resolve, 900));
     }
-
     const finalText = cleanedParts.join("\n\n").trim();
-
     if (!finalText) throw new Error("AI returned no cleaned text.");
-
     cleanedText = finalText;
     usingCleanText = true;
-
     sentences = splitIntoSentences(cleanedText);
-    chapters = mapAIChapters(detectedChapters, cleanedText, sentences);
-
-    if (!chapters.length) {
-      chapters = [{title:"Beginning",index:0}];
-    }
-
+    cleanedChapters = mapAIChapters(detectedChapters, cleanedText, sentences);
+    chapters = cleanedChapters.length ? cleanedChapters : detectChapters(sentences);
     currentIndex = 0;
     renderChapters();
     updateUI();
-
     $("cleanMode").disabled = false;
     $("originalMode").disabled = false;
     $("cleanMode").classList.add("selected");
     $("originalMode").classList.remove("selected");
-
-    aiStatus.textContent =
-      `Done. AI cleaned ${chunks.length} section(s). ` +
-      `${chapters.length} chapter marker(s) identified.` +
-      (notes.length ? " Review the document if any extraction issues remain." : "");
-
+    aiStatus.textContent = `Done. Cleaned ${chunks.length} section(s) using ${providerHint === "auto" ? "Groq/Gemini" : providerHint}. ${chapters.length} chapter marker(s) available.` +
+      (notes.length ? " Some extraction uncertainties were flagged; review the text before relying on it." : "");
     $("speechStatus").textContent = "AI-cleaned version ready.";
-
   } catch(error) {
     console.error(error);
-    aiStatus.textContent =
-      "AI processing failed: " + error.message +
-      " Your original extracted text is still available.";
+    aiStatus.textContent = "AI processing failed: " + error.message + " Your original extracted text is still available.";
   } finally {
     aiButton.disabled = false;
     aiButton.textContent = "✨ Clean & Organise with AI";
@@ -601,9 +662,7 @@ $("cleanMode").addEventListener("click", () => {
   stopReading();
   usingCleanText = true;
   sentences = splitIntoSentences(cleanedText);
-  chapters = mapAIChapters(
-    [], cleanedText, sentences
-  );
+  chapters = cleanedChapters.length ? cleanedChapters : detectChapters(sentences);
   // Restore chapter positions from the AI chapter data.
   currentIndex = 0;
   $("cleanMode").classList.add("selected");
